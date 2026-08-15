@@ -251,7 +251,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 	elif 'TranAD' in model.name:
 		l = nn.MSELoss(reduction = 'none')
 		data_x = torch.DoubleTensor(data); dataset = TensorDataset(data_x, data_x)
-		bs = model.batch if training else len(data)
+		bs = model.batch
 		dataloader = DataLoader(dataset, batch_size = bs)
 		n = epoch + 1; w_size = model.n_window
 		l1s, l2s = [], []
@@ -272,13 +272,16 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 			tqdm.write(f'Epoch {epoch},\tL1 = {np.mean(l1s)}')
 			return np.mean(l1s), optimizer.param_groups[0]['lr']
 		else:
+			losses, predictions = [], []
 			for d, _ in dataloader:
+				local_bs = d.shape[0]
 				window = d.permute(1, 0, 2)
-				elem = window[-1, :, :].view(1, bs, feats)
+				elem = window[-1, :, :].view(1, local_bs, feats)
 				z = model(window, elem)
 				if isinstance(z, tuple): z = z[1]
-			loss = l(z, elem)[0]
-			return loss.detach().numpy(), z.detach().numpy()[0]
+				losses.append(l(z, elem)[0])
+				predictions.append(z[0])
+			return torch.cat(losses).detach().numpy(), torch.cat(predictions).detach().numpy()
 	else:
 		y_pred = model(data)
 		loss = l(y_pred, data)
@@ -316,10 +319,10 @@ if __name__ == '__main__':
 		plot_accuracies(accuracy_list, f'{args.model}_{args.dataset}')
 
 	### Testing phase
-	torch.zero_grad = True
 	model.eval()
 	print(f'{color.HEADER}Testing {args.model} on {args.dataset}{color.ENDC}')
-	loss, y_pred = backprop(0, model, testD, testO, optimizer, scheduler, training=False)
+	with torch.no_grad():
+		loss, y_pred = backprop(0, model, testD, testO, optimizer, scheduler, training=False)
 
 	### Plot curves
 	if not args.test:
@@ -328,12 +331,12 @@ if __name__ == '__main__':
 
 	### Scores
 	df = pd.DataFrame()
-	lossT, _ = backprop(0, model, trainD, trainO, optimizer, scheduler, training=False)
+	with torch.no_grad():
+		lossT, _ = backprop(0, model, trainD, trainO, optimizer, scheduler, training=False)
 	for i in range(loss.shape[1]):
 		lt, l, ls = lossT[:, i], loss[:, i], labels[:, i]
 		result, pred = pot_eval(lt, l, ls); preds.append(pred)
-		# df = df.append(result, ignore_index=True)
-		df = pd.concat([df, pd.DataFrame([result])],ignore_index=True)
+		df = df.append(result, ignore_index=True)
 	# preds = np.concatenate([i.reshape(-1, 1) + 0 for i in preds], axis=1)
 	# pd.DataFrame(preds, columns=[str(i) for i in range(10)]).to_csv('labels.csv')
 	lossTfinal, lossFinal = np.mean(lossT, axis=1), np.mean(loss, axis=1)
