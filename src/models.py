@@ -22,8 +22,8 @@ class LSTM_Univariate(nn.Module):
 		self.lstm = nn.ModuleList([nn.LSTM(1, self.n_hidden) for i in range(feats)])
 
 	def forward(self, x):
-		hidden = [(torch.rand(1, 1, self.n_hidden, dtype=torch.float64), 
-			torch.randn(1, 1, self.n_hidden, dtype=torch.float64)) for i in range(self.n_feats)]
+		hidden = [(torch.rand(1, 1, self.n_hidden, dtype=x.dtype, device=x.device),
+			torch.randn(1, 1, self.n_hidden, dtype=x.dtype, device=x.device)) for i in range(self.n_feats)]
 		outputs = []
 		for i, g in enumerate(x):
 			multivariate_output = []
@@ -67,8 +67,8 @@ class LSTM_AD(nn.Module):
 		self.fcn = nn.Sequential(nn.Linear(self.n_feats, self.n_feats), nn.Sigmoid())
 
 	def forward(self, x):
-		hidden = (torch.rand(1, 1, self.n_hidden, dtype=torch.float64), torch.randn(1, 1, self.n_hidden, dtype=torch.float64))
-		hidden2 = (torch.rand(1, 1, self.n_feats, dtype=torch.float64), torch.randn(1, 1, self.n_feats, dtype=torch.float64))
+		hidden = (torch.rand(1, 1, self.n_hidden, dtype=x.dtype, device=x.device), torch.randn(1, 1, self.n_hidden, dtype=x.dtype, device=x.device))
+		hidden2 = (torch.rand(1, 1, self.n_feats, dtype=x.dtype, device=x.device), torch.randn(1, 1, self.n_feats, dtype=x.dtype, device=x.device))
 		outputs = []
 		for i, g in enumerate(x):
 			out, hidden = self.lstm(g.view(1, 1, -1), hidden)
@@ -146,7 +146,7 @@ class OmniAnomaly(nn.Module):
 		)
 
 	def forward(self, x, hidden = None):
-		hidden = torch.rand(2, 1, self.n_hidden, dtype=torch.float64) if hidden is not None else hidden
+		hidden = torch.rand(2, 1, self.n_hidden, dtype=x.dtype, device=x.device) if hidden is not None else hidden
 		out, hidden = self.lstm(x.view(1, 1, -1), hidden)
 		## Encode
 		x = self.encoder(out)
@@ -270,13 +270,14 @@ class MTAD_GAT(nn.Module):
 		self.gru = nn.GRU((feats+1)*feats*3, feats*feats, 1)
 
 	def forward(self, data, hidden):
-		hidden = torch.rand(1, 1, self.n_hidden, dtype=torch.float64) if hidden is not None else hidden
+		hidden = torch.rand(1, 1, self.n_hidden, dtype=data.dtype, device=data.device) if hidden is not None else hidden
+		self.g = self.g.to(data.device)
 		data = data.view(self.n_window, self.n_feats)
-		data_r = torch.cat((torch.zeros(1, self.n_feats), data))
+		data_r = torch.cat((data.new_zeros(1, self.n_feats), data))
 		feat_r = self.feature_gat(self.g, data_r)
-		data_t = torch.cat((torch.zeros(1, self.n_feats), data.t()))
+		data_t = torch.cat((data.new_zeros(1, self.n_feats), data.t()))
 		time_r = self.time_gat(self.g, data_t)
-		data = torch.cat((torch.zeros(1, self.n_feats), data))
+		data = torch.cat((data.new_zeros(1, self.n_feats), data))
 		data = data.view(self.n_window+1, self.n_feats, 1)
 		x = torch.cat((data, feat_r, time_r), dim=2).view(1, 1, -1)
 		x, h = self.gru(x, hidden)
@@ -308,6 +309,7 @@ class GDN(nn.Module):
 		)
 
 	def forward(self, data):
+		self.g = self.g.to(data.device)
 		# Bahdanau style attention
 		att_score = self.attention(data).view(self.n_window, 1)
 		data = data.view(self.n_window, self.n_feats)

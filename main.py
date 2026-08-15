@@ -1,7 +1,11 @@
 import pickle
 import os
+import sys
 import pandas as pd
+import torch
 from tqdm import tqdm
+from src.config import DEVICE
+from src.memory import is_out_of_memory_error, release_memory
 from src.models import *
 from src.constants import *
 from src.plotting import *
@@ -46,23 +50,32 @@ def save_model(model, optimizer, scheduler, epoch, accuracy_list):
 	folder = f'checkpoints/{args.model}_{args.dataset}/'
 	os.makedirs(folder, exist_ok=True)
 	file_path = f'{folder}/model.ckpt'
-	torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'accuracy_list': accuracy_list}, file_path)
+	temporary_path = f'{file_path}.tmp'
+	try:
+		torch.save({
+			'epoch': epoch,
+			'model_state_dict': model.state_dict(),
+			'optimizer_state_dict': optimizer.state_dict(),
+			'scheduler_state_dict': scheduler.state_dict(),
+			'accuracy_list': accuracy_list}, temporary_path)
+		os.replace(temporary_path, file_path)
+	except BaseException:
+		try:
+			os.remove(temporary_path)
+		except OSError:
+			pass
+		raise
 
 def load_model(modelname, dims):
 	import src.models
 	model_class = getattr(src.models, modelname)
-	model = model_class(dims).double()
+	model = model_class(dims).double().to(DEVICE)
 	optimizer = torch.optim.AdamW(model.parameters() , lr=model.lr, weight_decay=1e-5)
 	scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 5, 0.9)
 	fname = f'checkpoints/{args.model}_{args.dataset}/model.ckpt'
 	if os.path.exists(fname) and (not args.retrain or args.test):
 		print(f"{color.GREEN}Loading pre-trained model: {model.name}{color.ENDC}")
-		checkpoint = torch.load(fname)
+		checkpoint = torch.load(fname, map_location=DEVICE)
 		model.load_state_dict(checkpoint['model_state_dict'])
 		optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 		scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -78,7 +91,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 	feats = dataO.shape[1]
 	if 'DAGMM' in model.name:
 		l = nn.MSELoss(reduction = 'none')
-		compute = ComputeLoss(model, 0.1, 0.005, 'cpu', model.n_gmm)
+		compute = ComputeLoss(model, 0.1, 0.005, DEVICE, model.n_gmm)
 		n = epoch + 1; w_size = model.n_window
 		l1s = []; l2s = []
 		if training:
@@ -101,7 +114,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 			ae1s = torch.stack(ae1s)
 			y_pred = ae1s[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
 			loss = l(ae1s, data)[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
-			return loss.detach().numpy(), y_pred.detach().numpy()
+			return loss.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 	if 'Attention' in model.name:
 		l = nn.MSELoss(reduction = 'none')
 		n = epoch + 1; w_size = model.n_window
@@ -128,7 +141,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 				ae1s.append(ae1)
 			ae1s, y_pred = torch.stack(ae1s), torch.stack(y_pred)
 			loss = torch.mean(l(ae1s, data), axis=1)
-			return loss.detach().numpy(), y_pred.detach().numpy()
+			return loss.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 	elif 'OmniAnomaly' in model.name:
 		if training:
 			mses, klds = [], []
@@ -151,7 +164,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 				y_preds.append(y_pred)
 			y_pred = torch.stack(y_preds)
 			MSE = l(y_pred, data)
-			return MSE.detach().numpy(), y_pred.detach().numpy()
+			return MSE.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 	elif 'USAD' in model.name:
 		l = nn.MSELoss(reduction = 'none')
 		n = epoch + 1; w_size = model.n_window
@@ -178,7 +191,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 			y_pred = ae1s[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
 			loss = 0.1 * l(ae1s, data) + 0.9 * l(ae2ae1s, data)
 			loss = loss[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
-			return loss.detach().numpy(), y_pred.detach().numpy()
+			return loss.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 	elif model.name in ['GDN', 'MTAD_GAT', 'MSCRED', 'CAE_M']:
 		l = nn.MSELoss(reduction = 'none')
 		n = epoch + 1; w_size = model.n_window
@@ -208,13 +221,13 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 			y_pred = xs[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
 			loss = l(xs, data)
 			loss = loss[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
-			return loss.detach().numpy(), y_pred.detach().numpy()
+			return loss.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 	elif 'GAN' in model.name:
 		l = nn.MSELoss(reduction = 'none')
 		bcel = nn.BCELoss(reduction = 'mean')
 		msel = nn.MSELoss(reduction = 'mean')
-		real_label, fake_label = torch.tensor([0.9]), torch.tensor([0.1]) # label smoothing
-		real_label, fake_label = real_label.type(torch.DoubleTensor), fake_label.type(torch.DoubleTensor)
+		real_label = torch.tensor([0.9], dtype=torch.double, device=DEVICE)
+		fake_label = torch.tensor([0.1], dtype=torch.double, device=DEVICE) # label smoothing
 		n = epoch + 1; w_size = model.n_window
 		mses, gls, dls = [], [], []
 		if training:
@@ -247,16 +260,17 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 			y_pred = outputs[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
 			loss = l(outputs, data)
 			loss = loss[:, data.shape[1]-feats:data.shape[1]].view(-1, feats)
-			return loss.detach().numpy(), y_pred.detach().numpy()
+			return loss.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 	elif 'TranAD' in model.name:
 		l = nn.MSELoss(reduction = 'none')
-		data_x = torch.DoubleTensor(data); dataset = TensorDataset(data_x, data_x)
+		data_x = data.to(dtype=torch.double); dataset = TensorDataset(data_x, data_x)
 		bs = model.batch
 		dataloader = DataLoader(dataset, batch_size = bs)
 		n = epoch + 1; w_size = model.n_window
 		l1s, l2s = [], []
 		if training:
 			for d, _ in dataloader:
+				d = d.to(DEVICE)
 				local_bs = d.shape[0]
 				window = d.permute(1, 0, 2)
 				elem = window[-1, :, :].view(1, local_bs, feats)
@@ -274,6 +288,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 		else:
 			losses, predictions = [], []
 			for d, _ in dataloader:
+				d = d.to(DEVICE)
 				local_bs = d.shape[0]
 				window = d.permute(1, 0, 2)
 				elem = window[-1, :, :].view(1, local_bs, feats)
@@ -281,7 +296,7 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 				if isinstance(z, tuple): z = z[1]
 				losses.append(l(z, elem)[0])
 				predictions.append(z[0])
-			return torch.cat(losses).detach().numpy(), torch.cat(predictions).detach().numpy()
+			return torch.cat(losses).detach().cpu().numpy(), torch.cat(predictions).detach().cpu().numpy()
 	else:
 		y_pred = model(data)
 		loss = l(y_pred, data)
@@ -293,9 +308,9 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 			scheduler.step()
 			return loss.item(), optimizer.param_groups[0]['lr']
 		else:
-			return loss.detach().numpy(), y_pred.detach().numpy()
+			return loss.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 
-if __name__ == '__main__':
+def main():
 	train_loader, test_loader, labels = load_dataset(args.dataset)
 	if args.model in ['MERLIN']:
 		eval(f'run_{args.model.lower()}(test_loader, labels, args.dataset)')
@@ -306,6 +321,8 @@ if __name__ == '__main__':
 	trainO, testO = trainD, testD
 	if model.name in ['Attention', 'DAGMM', 'USAD', 'MSCRED', 'CAE_M', 'GDN', 'MTAD_GAT', 'MAD_GAN'] or 'TranAD' in model.name: 
 		trainD, testD = convert_to_windows(trainD, model), convert_to_windows(testD, model)
+	if 'TranAD' not in model.name:
+		trainD, testD = trainD.to(DEVICE), testD.to(DEVICE)
 
 	### Training phase
 	if not args.test:
@@ -314,8 +331,8 @@ if __name__ == '__main__':
 		for e in tqdm(list(range(epoch+1, epoch+num_epochs+1))):
 			lossT, lr = backprop(e, model, trainD, trainO, optimizer, scheduler)
 			accuracy_list.append((lossT, lr))
+			save_model(model, optimizer, scheduler, e, accuracy_list)
 		print(color.BOLD+'Training time: '+"{:10.4f}".format(time()-start)+' s'+color.ENDC)
-		save_model(model, optimizer, scheduler, e, accuracy_list)
 		plot_accuracies(accuracy_list, f'{args.model}_{args.dataset}')
 
 	### Testing phase
@@ -348,3 +365,34 @@ if __name__ == '__main__':
 	pprint(result)
 	# pprint(getresults2(df, result))
 	# beep(4)
+
+
+def run_with_memory_guard():
+	try:
+		main()
+		return 0
+	except (MemoryError, OSError, RuntimeError) as error:
+		if not is_out_of_memory_error(error):
+			raise
+		details = str(error)
+
+	# At this point the failed operation's traceback and tensors are no longer
+	# retained by the exception handler, so cached accelerator memory can be freed.
+	release_memory()
+	print(
+		f'{color.FAIL}Out of memory. The current run was stopped safely and memory '
+		f'caches were released.{color.ENDC}',
+		file=sys.stderr,
+	)
+	print(
+		'Any checkpoint from the last completed epoch is still available. '
+		'Try --less, a smaller model/batch, or device: "cpu" in config.yaml.',
+		file=sys.stderr,
+	)
+	if details:
+		print(f'Details: {details}', file=sys.stderr)
+	return 1
+
+
+if __name__ == '__main__':
+	raise SystemExit(run_with_memory_guard())

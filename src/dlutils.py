@@ -57,8 +57,10 @@ class ConvLSTMCell(nn.Module):
 
     def init_hidden(self, batch_size, image_size):
         height, width = image_size
-        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
-                torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
+        return (torch.zeros(batch_size, self.hidden_dim, height, width,
+                            dtype=self.conv.weight.dtype, device=self.conv.weight.device),
+                torch.zeros(batch_size, self.hidden_dim, height, width,
+                            dtype=self.conv.weight.dtype, device=self.conv.weight.device))
 
 class ConvLSTM(nn.Module):
 
@@ -280,7 +282,9 @@ class ComputeLoss:
         det_cov = []
         cov_diag = 0
         for k in range(self.n_gmm):
-            cov_k = cov[k] + (torch.eye(cov[k].size(-1))*eps).to(self.device)
+            cov_k = cov[k] + torch.eye(
+                cov[k].size(-1), dtype=cov.dtype, device=cov.device
+            ) * eps
             cov_inverse.append(torch.inverse(cov_k).unsqueeze(0))
             det_cov.append((Cholesky.apply(cov_k.cpu() * (2*np.pi)).diag().prod()).unsqueeze(0))
             cov_diag += torch.sum(1 / cov_k.diag())
