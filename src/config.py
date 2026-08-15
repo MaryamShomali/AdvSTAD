@@ -33,5 +33,18 @@ def get_device(config):
     return device
 
 
+def get_dtype(config):
+    dtype_name = config.get("dtype", "float64")
+    dtypes = {
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    if dtype_name not in dtypes:
+        supported = ", ".join(dtypes)
+        raise ValueError(f"config.yaml 'dtype' must be one of: {supported}")
+    return dtypes[dtype_name]
+
+
 CONFIG = load_config()
 DEVICE = get_device(CONFIG)
+DTYPE = get_dtype(CONFIG)

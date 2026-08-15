@@ -1,1 +1,2 @@
-device: "cuda" # cuda or cpu
+device: "cpu" # cuda or cpu
+dtype: "float32" # float32 uses half the memory of float64
