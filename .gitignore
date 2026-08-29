@@ -6,6 +6,8 @@ processed/
 plots/
 checkpoints/
 data/
+runs/
+experiments.jsonl
 main.PNG
 data/MSDS/metrics
 data/MSDS/train.csv

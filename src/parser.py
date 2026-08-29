@@ -22,4 +22,8 @@ parser.add_argument('--retrain',
 parser.add_argument('--less', 
 					action='store_true', 
 					help="train using less data")
+parser.add_argument('--run-name',
+					type=str,
+					default=None,
+					help="optional experiment label used in tracked run names")
 args = parser.parse_args()

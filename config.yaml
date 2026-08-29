@@ -1,2 +1,7 @@
 device: "cpu" # cuda or cpu
 dtype: "float32" # float32 uses half the memory of float64
+
+experiment_tracking:
+  enabled: true
+  log_dir: "runs"
+  index_file: "experiments.jsonl"

@@ -1,5 +1,7 @@
 # Experiment Log
 
+This file contains the original human-readable experiment records. New runs retain the same date/label/model/dataset/result fields in `experiments.jsonl`; each entry points to a detailed `runs/<run-id>/run.json`, per-feature CSV metrics, TensorBoard events, checkpoints, plots, and relevant reproducibility metadata.
+
 ## Experiment 1 - CPU Result
 
 Date: 2026-08-11

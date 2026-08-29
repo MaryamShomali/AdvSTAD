@@ -4,7 +4,8 @@ import sys
 import pandas as pd
 import torch
 from tqdm import tqdm
-from src.config import DEVICE, DTYPE
+from src.config import CONFIG, DEVICE, DTYPE
+from src.experiment_tracking import ExperimentTracker
 from src.memory import is_out_of_memory_error, release_memory
 from src.models import *
 from src.constants import *
@@ -86,6 +87,7 @@ def save_model(model, optimizer, scheduler, epoch, accuracy_list):
 		except OSError:
 			pass
 		raise
+	return file_path
 
 def load_model(modelname, dims):
 	import src.models
@@ -335,10 +337,13 @@ def backprop(epoch, model, data, feats, optimizer, scheduler, training = True):
 		else:
 			return loss.detach().cpu().numpy(), y_pred.detach().cpu().numpy()
 
-def main():
+def run_experiment(tracker):
 	trainD, testD, labels = load_dataset(args.dataset)
+	tracker.log_dataset(trainD, testD, labels)
 	if args.model in ['MERLIN']:
-		eval(f'run_{args.model.lower()}(testD, labels, args.dataset)')
+		result, evaluation_time = eval(f'run_{args.model.lower()}(testD, labels, args.dataset)')
+		tracker.log_overall_evaluation(result)
+		tracker.log_timing('evaluation', evaluation_time)
 		return
 	model, optimizer, scheduler, epoch, accuracy_list = load_model(args.model, labels.shape[1])
 
@@ -348,6 +353,11 @@ def main():
 		model.name in ['Attention', 'DAGMM', 'USAD', 'MSCRED', 'CAE_M', 'GDN', 'MTAD_GAT', 'MAD_GAN']
 		or 'TranAD' in model.name
 	)
+	num_epochs = 5
+	tracker.log_model(model, optimizer, scheduler, epoch + 1, windowed, num_epochs)
+	checkpoint_path = f'checkpoints/{args.model}_{args.dataset}/model.ckpt'
+	if epoch >= 0:
+		tracker.log_checkpoint(checkpoint_path, epoch, loaded=True)
 	testO = testD if not args.test else None
 	if windowed and not args.test:
 		trainD = convert_to_windows(trainD, model)
@@ -355,15 +365,23 @@ def main():
 	### Training phase
 	if not args.test:
 		print(f'{color.HEADER}Training {args.model} on {args.dataset}{color.ENDC}')
-		num_epochs = 5; e = epoch + 1; start = time()
+		e = epoch + 1; start = time()
 		for e in tqdm(list(range(epoch+1, epoch+num_epochs+1))):
 			lossT, lr = backprop(e, model, trainD, feats, optimizer, scheduler)
 			accuracy_list.append((lossT, lr))
-			save_model(model, optimizer, scheduler, e, accuracy_list)
-		print(color.BOLD+'Training time: '+"{:10.4f}".format(time()-start)+' s'+color.ENDC)
+			checkpoint_path = save_model(model, optimizer, scheduler, e, accuracy_list)
+			tracker.log_training_epoch(e, lossT, lr)
+			tracker.log_checkpoint(checkpoint_path, e)
+		training_time = time() - start
+		print(color.BOLD+'Training time: '+"{:10.4f}".format(training_time)+' s'+color.ENDC)
+		tracker.log_timing('training', training_time)
 		plot_accuracies(accuracy_list, f'{args.model}_{args.dataset}')
+		tracker.log_artifact(
+			'training_plot', f'plots/{args.model}_{args.dataset}/training-graph.pdf',
+		)
 
 	### Testing phase
+	evaluation_start = time()
 	if windowed:
 		testD = convert_to_windows(testD, model)
 	model.eval()
@@ -376,6 +394,7 @@ def main():
 	if not args.test:
 		if 'TranAD' in model.name: testO = torch.roll(testO, 1, 0) 
 		plotter(f'{args.model}_{args.dataset}', testO, y_pred, loss, labels)
+		tracker.log_artifact('evaluation_plot', f'plots/{args.model}_{args.dataset}/output.pdf')
 		del testO
 	release_memory()
 
@@ -396,10 +415,27 @@ def main():
 	result, _ = pot_eval(lossTfinal, lossFinal, labelsFinal)
 	result.update(hit_att(loss, labels))
 	result.update(ndcg(loss, labels))
+	tracker.log_evaluation(lossT, loss, result, df)
+	tracker.log_timing('evaluation', time() - evaluation_start)
 	print(df)
 	pprint(result)
 	# pprint(getresults2(df, result))
 	# beep(4)
+
+
+def main():
+	tracker = ExperimentTracker(CONFIG, args, DEVICE, DTYPE)
+	try:
+		run_experiment(tracker)
+	except BaseException as error:
+		try:
+			tracker.fail(error)
+		except Exception as tracking_error:
+			print(f'Could not record experiment failure: {tracking_error}', file=sys.stderr)
+		raise
+	tracker.complete()
+	if tracker.enabled:
+		print(f'Experiment artifacts: {tracker.run_dir}')
 
 
 def run_with_memory_guard():
