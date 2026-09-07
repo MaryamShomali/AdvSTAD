@@ -1,7 +1,24 @@
-device: "cpu" # cuda or cpu
+device: "cuda" # cuda or cpu
 dtype: "float32" # float32 uses half the memory of float64
 
 experiment_tracking:
   enabled: true
   log_dir: "runs"
   index_file: "experiments.jsonl"
+
+advstad:
+  window_size: 10
+  batch_size: 128
+  d_model: null # defaults to twice the inferred sensor count
+  nhead: null # defaults to the inferred sensor count
+  temporal_layers: 1
+  spatial_layers: 1
+  decoder_layers: 1
+  dim_feedforward: 16
+  dropout: 0.1
+  fusion: sum # sum | concat | cross_attention
+  training:
+    epochs_per_run: 5
+    learning_rate: null # use the dataset-specific baseline learning rate
+    adversarial_weight: 0.1
+    gradient_clip_norm: 1.0 # null disables clipping

@@ -1,6 +1,10 @@
 import argparse
 
-parser = argparse.ArgumentParser(description='Time-Series Anomaly Detection')
+parser = argparse.ArgumentParser(
+    description='Time-Series Anomaly Detection',
+    epilog='Example: python main.py --model AdvSTAD --dataset SMD --retrain. '
+           'Set advstad.fusion in config.yaml to sum, concat, or cross_attention.',
+)
 parser.add_argument('--dataset', 
 					metavar='-d', 
 					type=str, 
@@ -12,7 +16,7 @@ parser.add_argument('--model',
 					type=str, 
 					required=False,
 					default='LSTM_Multivariate',
-                    help="model name")
+                    help="model name, e.g. AdvSTAD, TranAD, or LSTM_Multivariate")
 parser.add_argument('--test', 
 					action='store_true', 
 					help="test the model")

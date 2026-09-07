@@ -200,6 +200,12 @@ class ExperimentTracker:
 			'anomalous_label_rate': anomaly_count / labels.size,
 		}
 		self.record['dataset_details'] = details
+		if self.record['model'] == 'AdvSTAD':
+			# Sigmoid outputs are retained, but observations are never clipped.
+			details['observation_ranges'] = {
+				name: {'min': float(values.min()), 'max': float(values.max())}
+				for name, values in [('train', train_data), ('test', test_data)]
+			}
 		self.writer.add_scalar('dataset/train_time_steps', train_data.shape[0], 0)
 		self.writer.add_scalar('dataset/test_time_steps', test_data.shape[0], 0)
 		self.writer.add_scalar('dataset/features', labels.shape[1], 0)
@@ -216,6 +222,21 @@ class ExperimentTracker:
 		):
 			if hasattr(model, name):
 				model_attributes[name] = getattr(model, name)
+		def optimizer_details(value):
+			return {
+				'name': value.__class__.__name__,
+				'learning_rate': value.param_groups[0]['lr'],
+				'weight_decay': value.param_groups[0].get('weight_decay'),
+			}
+
+		def scheduler_details(value):
+			return {
+				'name': value.__class__.__name__,
+				'step_size': getattr(value, 'step_size', None),
+				'gamma': getattr(value, 'gamma', None),
+			}
+
+		named_optimizers = isinstance(optimizer, dict)
 		hyperparameters = {
 			'epochs_per_run': epochs_per_run,
 			'model': model_attributes,
@@ -223,19 +244,26 @@ class ExperimentTracker:
 			'trainable_parameter_count': sum(
 				parameter.numel() for parameter in model.parameters() if parameter.requires_grad
 			),
-			'optimizer': {
-				'name': optimizer.__class__.__name__,
-				'learning_rate': optimizer.param_groups[0]['lr'],
-				'weight_decay': optimizer.param_groups[0].get('weight_decay'),
-			},
-			'scheduler': {
-				'name': scheduler.__class__.__name__,
-				'step_size': getattr(scheduler, 'step_size', None),
-				'gamma': getattr(scheduler, 'gamma', None),
-			},
 			'starting_epoch': starting_epoch,
 			'windowed_input': windowed,
 		}
+		if named_optimizers:
+			hyperparameters['optimizers'] = {name: optimizer_details(value) for name, value in optimizer.items()}
+			hyperparameters['schedulers'] = {name: scheduler_details(value) for name, value in scheduler.items()}
+		else:
+			hyperparameters['optimizer'] = optimizer_details(optimizer)
+			hyperparameters['scheduler'] = scheduler_details(scheduler)
+		if model.name == 'AdvSTAD':
+			from src.advstad_checkpoint import checkpoint_metadata, experiment_key
+			metadata = checkpoint_metadata(model)
+			hyperparameters['advstad'] = model.resolved_config
+			hyperparameters['checkpoint_metadata'] = metadata
+			hyperparameters['training_loss_label'] = 'Generator objective'
+			self.record['experiment_key'] = experiment_key(model, self.record['dataset'])
+			self.record['dataset_details']['window_alignment'] = metadata['window_alignment']
+			self.record['dataset_details']['sensor_identifiers'] = metadata['sensor_identifiers']
+		elif 'TranAD' in model.name:
+			self.record['dataset_details']['window_alignment'] = 'legacy_previous_endpoint'
 		self.record['hyperparameters'] = hyperparameters
 		self.writer.add_text('experiment/hyperparameters', json.dumps(
 			_json_safe(hyperparameters), indent=2, sort_keys=True,
@@ -258,17 +286,21 @@ class ExperimentTracker:
 		self.record['artifacts'][name] = _path_from_project(path)
 		self._write_summary()
 
-	def log_training_epoch(self, epoch, loss, learning_rate):
+	def log_training_epoch(self, epoch, loss, learning_rate, metrics=None):
 		if not self.enabled:
 			return
+		extra_metrics = metrics or {}
 		metrics = {
 			'epoch': epoch,
 			'loss': loss,
 			'learning_rate': learning_rate,
+			**extra_metrics,
 		}
 		self.record['metrics']['training'].append(metrics)
 		self.writer.add_scalar('training/loss', loss, epoch)
 		self.writer.add_scalar('training/learning_rate', learning_rate, epoch)
+		for name, value in extra_metrics.items():
+			self.writer.add_scalar(f'training/{_metric_tag(name)}', value, epoch)
 		self._write_summary()
 
 	def log_timing(self, name, seconds):
@@ -276,6 +308,25 @@ class ExperimentTracker:
 			return
 		self.record['metrics'].setdefault('timing_seconds', {})[name] = seconds
 		self.writer.add_scalar(f'timing/{_metric_tag(name)}_seconds', seconds, 0)
+		self._write_summary()
+
+	def log_resource_usage(self, device):
+		"""Record process peaks with explicit scope for cost comparisons."""
+		if not self.enabled:
+			return
+		usage = {}
+		try:
+			import resource
+			rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+			usage['process_peak_rss_bytes'] = int(rss if sys.platform == 'darwin' else rss * 1024)
+		except ImportError:
+			pass
+		if device.type == 'cuda':
+			usage['cuda_peak_allocated_bytes'] = torch.cuda.max_memory_allocated(device)
+			usage['cuda_peak_reserved_bytes'] = torch.cuda.max_memory_reserved(device)
+		self.record['metrics']['memory'] = usage
+		for name, value in usage.items():
+			self.writer.add_scalar(f'memory/{name}', value, 0)
 		self._write_summary()
 
 	def log_evaluation(self, reference_loss, test_loss, result, feature_metrics):

@@ -9,6 +9,7 @@ from torch.nn import TransformerEncoder
 from torch.nn import TransformerDecoder
 from src.dlutils import *
 from src.constants import *
+from src.config import get_advstad_config
 torch.manual_seed(1)
 
 ## Separate LSTM for each variable
@@ -524,3 +525,192 @@ class TranAD(nn.Module):
 		c = (x1 - src) ** 2
 		x2 = self.fcn(self.transformer_decoder2(*self.encode(src, c, tgt)))
 		return x1, x2
+
+	#advstad
+	
+
+class SpatioTemporalFusion(nn.Module):
+    """Fuse time tokens [W,B,D] and sensor tokens [F,B,D] into [W,B,D]."""
+
+    def __init__(self, method, n_feats, n_window, d_model, nhead, dropout=0.1):
+        super().__init__()
+        # Reuse the model's validation for the independently usable fusion module.
+        settings = get_advstad_config({"advstad": {
+            "fusion": method, "window_size": n_window, "d_model": d_model,
+            "nhead": nhead, "dropout": dropout,
+        }}, n_feats, 0.001)
+        self.method = settings["fusion"]
+        self.n_feats = n_feats
+        self.n_window = settings["window_size"]
+        self.d_model = settings["d_model"]
+        if self.method in ("sum", "concat"):
+            self.spatial_to_time = nn.Linear(self.d_model, self.n_window)
+            self.sensor_projection = nn.Linear(self.n_feats, self.d_model)
+            if self.method == "concat":
+                self.concat_projection = nn.Linear(2 * self.d_model, self.d_model)
+        else:
+            self.cross_attention = nn.MultiheadAttention(
+                # The sequence-first default also supports PyTorch 1.8, whose
+                # constructor predates the batch_first keyword.
+                self.d_model, settings["nhead"], dropout=settings["dropout"],
+            )
+            self.dropout = nn.Dropout(settings["dropout"])
+
+    def forward(self, temporal, spatial):
+        for name, tensor, tokens in (
+            ("temporal", temporal, self.n_window),
+            ("spatial", spatial, self.n_feats),
+        ):
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 3:
+                raise ValueError(f"{name} must be a rank-3 [tokens,batch,d_model] tensor")
+            if tensor.shape[0] != tokens or tensor.shape[2] != self.d_model:
+                raise ValueError(f"{name} must have shape [{tokens},B,{self.d_model}]")
+            if tensor.shape[1] < 1:
+                raise ValueError(f"{name} batch size must be positive")
+        if temporal.shape[1] != spatial.shape[1]:
+            raise ValueError("Temporal and spatial batch sizes must match")
+        if temporal.dtype != spatial.dtype or temporal.device != spatial.device:
+            raise ValueError("Temporal and spatial dtype/device must match")
+        reference = next(self.parameters())
+        if temporal.dtype != reference.dtype or temporal.device != reference.device:
+            raise ValueError("Fusion inputs must match the module dtype/device")
+        if self.method == "cross_attention":
+            attention = self.cross_attention(
+                query=temporal, key=spatial, value=spatial, need_weights=False
+            )[0]
+            return temporal + self.dropout(attention)
+        aligned = self.sensor_projection(self.spatial_to_time(spatial).permute(2, 1, 0))
+        if self.method == "sum":
+            return temporal + aligned
+        return self.concat_projection(torch.cat((temporal, aligned), dim=-1))
+
+
+class AdvSTAD(nn.Module):
+    """Endpoint reconstruction with separate temporal/spatial attention routes.
+
+    The two phases share encoders and fusion. Decoder 1 supplies attached squared
+    residual conditioning to decoder 2; alternating optimization lives in
+    ``src.advstad_training`` so inference never changes parameter ownership.
+    """
+
+    def __init__(self, feats, config=None):
+        super().__init__()
+        self.config = get_advstad_config(
+            {"advstad": {} if config is None else config}, feats, lr
+        )
+        self.resolved_config = self.config
+        settings = self.config
+        self.name = "AdvSTAD"
+        self.n_feats = int(feats)
+        self.n_window = settings["window_size"]
+        self.batch = settings["batch_size"]
+        self.lr = settings["training"]["learning_rate"]
+        self.n = self.n_feats * self.n_window
+        self.d_model = settings["d_model"]
+        self.nhead = settings["nhead"]
+        dropout = settings["dropout"]
+        self.temporal_input_projection = (
+            nn.Identity() if self.d_model == 2 * self.n_feats
+            else nn.Linear(2 * self.n_feats, self.d_model)
+        )
+        self.pos_encoder = PositionalEncoding(self.d_model, dropout, self.n_window)
+        self.spatial_input_projection = nn.Linear(2 * self.n_window, self.d_model)
+        self.sensor_embedding = nn.Parameter(torch.empty(self.n_feats, 1, self.d_model))
+        nn.init.normal_(self.sensor_embedding, std=0.02)
+        self.spatial_dropout = nn.Dropout(dropout)
+
+        layer_settings = {
+            "d_model": self.d_model, "nhead": self.nhead,
+            "dim_feedforward": settings["dim_feedforward"], "dropout": dropout,
+        }
+        self.temporal_encoder = nn.ModuleList([
+            TransformerEncoderLayer(**layer_settings)
+            for _ in range(settings["temporal_layers"])
+        ])
+        self.spatial_encoder = nn.ModuleList([
+            TransformerEncoderLayer(**layer_settings)
+            for _ in range(settings["spatial_layers"])
+        ])
+        self.fusion = SpatioTemporalFusion(
+            settings["fusion"], self.n_feats, self.n_window,
+            self.d_model, self.nhead, dropout,
+        )
+        self.target_projection = (
+            nn.Identity() if self.d_model == 2 * self.n_feats
+            else nn.Linear(2 * self.n_feats, self.d_model)
+        )
+        self.decoder1 = nn.ModuleList([
+            TransformerDecoderLayer(**layer_settings)
+            for _ in range(settings["decoder_layers"])
+        ])
+        self.decoder2 = nn.ModuleList([
+            TransformerDecoderLayer(**layer_settings)
+            for _ in range(settings["decoder_layers"])
+        ])
+        self.head1 = nn.Sequential(nn.Linear(self.d_model, self.n_feats), nn.Sigmoid())
+        self.head2 = nn.Sequential(nn.Linear(self.d_model, self.n_feats), nn.Sigmoid())
+
+    def _validate_tensor(self, tensor, name, tokens, width):
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 3:
+            raise ValueError(f"{name} must be a rank-3 [{tokens},B,{width}] tensor")
+        if tensor.shape[0] != tokens or tensor.shape[2] != width or tensor.shape[1] < 1:
+            raise ValueError(f"{name} must have shape [{tokens},B,{width}] with B > 0")
+        if (tensor.dtype != self.sensor_embedding.dtype
+                or tensor.device != self.sensor_embedding.device):
+            raise ValueError(f"{name} must match the model dtype/device")
+
+    def make_query(self, tgt):
+        self._validate_tensor(tgt, "tgt", 1, self.n_feats)
+        return self.target_projection(tgt.repeat(1, 1, 2))
+
+    def encode(self, src, conditioning):
+        self._validate_tensor(src, "src", self.n_window, self.n_feats)
+        self._validate_tensor(conditioning, "conditioning", self.n_window, self.n_feats)
+        if conditioning.shape != src.shape:
+            raise ValueError("conditioning and src shapes must match")
+
+        temporal = self.temporal_input_projection(torch.cat((src, conditioning), dim=-1))
+        temporal = self.pos_encoder(temporal * math.sqrt(self.n_feats))
+        for layer in self.temporal_encoder:
+            temporal = layer(temporal)
+
+        # Concatenate histories after transposing so each token remains one sensor.
+        spatial = torch.cat((src.permute(2, 1, 0), conditioning.permute(2, 1, 0)), dim=-1)
+        spatial = self.spatial_input_projection(spatial) * math.sqrt(self.n_window)
+        spatial = self.spatial_dropout(spatial + self.sensor_embedding)
+        for layer in self.spatial_encoder:
+            spatial = layer(spatial)
+        return self.fusion(temporal, spatial)
+
+    def _decode(self, query, memory, layers, head):
+        self._validate_tensor(query, "query", 1, self.d_model)
+        self._validate_tensor(memory, "memory", self.n_window, self.d_model)
+        if query.shape[1] != memory.shape[1]:
+            raise ValueError("query and memory batch sizes must match")
+        for layer in layers:
+            query = layer(query, memory)
+        return head(query)
+
+    def decode1(self, query, memory):
+        return self._decode(query, memory, self.decoder1, self.head1)
+
+    def decode2(self, query, memory):
+        return self._decode(query, memory, self.decoder2, self.head2)
+
+    def prepare_memories(self, src, tgt):
+        self._validate_tensor(src, "src", self.n_window, self.n_feats)
+        query = self.make_query(tgt)
+        if src.shape[1] != tgt.shape[1]:
+            raise ValueError("src and tgt batch sizes must match")
+        memory0 = self.encode(src, torch.zeros_like(src))
+        y1 = self.decode1(query, memory0)
+        memory1 = self.encode(src, (y1 - src).square())
+        return {"query": query, "memory0": memory0, "y1": y1, "memory1": memory1}
+
+    def forward(self, src, tgt, return_aux=False):
+        prepared = self.prepare_memories(src, tgt)
+        y2 = self.decode2(prepared["query"], prepared["memory1"])
+        if return_aux:
+            y2_base = self.decode2(prepared["query"], prepared["memory0"])
+            return {"y1": prepared["y1"], "y2": y2, "y2_base": y2_base}
+        return prepared["y1"], y2

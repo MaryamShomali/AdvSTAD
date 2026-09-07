@@ -1,10 +1,13 @@
 import pickle
 import os
 import sys
+import inspect
 import pandas as pd
 import torch
 from tqdm import tqdm
-from src.config import CONFIG, DEVICE, DTYPE
+from src.config import CONFIG, DEVICE, DTYPE, get_advstad_config
+from src.advstad_training import build_optimizers, train_epoch, evaluate
+from src.advstad_checkpoint import experiment_key, checkpoint_payload, restore_checkpoint
 from src.experiment_tracking import ExperimentTracker
 from src.memory import is_out_of_memory_error, release_memory
 from src.models import *
@@ -26,13 +29,14 @@ def convert_to_windows(data, model):
 
 	w_size = model.n_window
 	n_rows, n_feats = data.shape
-	padding = data[0:1].expand(w_size, -1)
+	padding_size = w_size - 1 if model.name == 'AdvSTAD' else w_size
+	padding = data[0:1].expand(padding_size, -1)
 	padded = torch.cat((padding, data), dim=0)
 	row_stride, feature_stride = padded.stride()
 
 	# Each window is a read-only overlapping view into one padded tensor. This
 	# avoids allocating an n_window-times-larger copy of the entire dataset.
-	if 'TranAD' in model.name or 'Attention' in model.name:
+	if model.name == 'AdvSTAD' or 'TranAD' in model.name or 'Attention' in model.name:
 		return padded.as_strided(
 			(n_rows, w_size, n_feats),
 			(row_stride, row_stride, feature_stride),
@@ -68,18 +72,39 @@ def load_dataset(dataset):
 		del values
 	return loaded['train'], loaded['test'], loaded['labels']
 
+def model_experiment_key(model):
+	if model.name == 'AdvSTAD':
+		return experiment_key(model, args.dataset)
+	return f'{args.model}_{args.dataset}'
+
+
+def validate_dataset_shapes(train_data, test_data, labels):
+	"""Resolve sensors from observations before constructing a model."""
+	for name, values in [('train', train_data), ('test', test_data), ('labels', labels)]:
+		if values.ndim != 2 or min(values.shape) == 0:
+			raise ValueError(f'{name} must be a non-empty [timestamps, sensors] array.')
+	if train_data.shape[1] != test_data.shape[1] or test_data.shape != labels.shape:
+		raise ValueError(
+			'Train/test sensor counts and test/label shapes must agree: '
+			f'train={tuple(train_data.shape)}, test={tuple(test_data.shape)}, '
+			f'labels={tuple(labels.shape)}.'
+		)
+	return train_data.shape[1]
+
+
 def save_model(model, optimizer, scheduler, epoch, accuracy_list):
-	folder = f'checkpoints/{args.model}_{args.dataset}/'
+	folder = f'checkpoints/{model_experiment_key(model)}/'
 	os.makedirs(folder, exist_ok=True)
 	file_path = f'{folder}/model.ckpt'
 	temporary_path = f'{file_path}.tmp'
 	try:
-		torch.save({
+		payload = checkpoint_payload(model, optimizer, scheduler, epoch, accuracy_list) if model.name == 'AdvSTAD' else {
 			'epoch': epoch,
 			'model_state_dict': model.state_dict(),
 			'optimizer_state_dict': optimizer.state_dict(),
 			'scheduler_state_dict': scheduler.state_dict(),
-			'accuracy_list': accuracy_list}, temporary_path)
+			'accuracy_list': accuracy_list}
+		torch.save(payload, temporary_path)
 		os.replace(temporary_path, file_path)
 	except BaseException:
 		try:
@@ -92,12 +117,22 @@ def save_model(model, optimizer, scheduler, epoch, accuracy_list):
 def load_model(modelname, dims):
 	import src.models
 	model_class = getattr(src.models, modelname)
-	model = model_class(dims).to(device=DEVICE, dtype=DTYPE)
-	optimizer = torch.optim.AdamW(model.parameters() , lr=model.lr, weight_decay=1e-5)
-	scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 5, 0.9)
-	fname = f'checkpoints/{args.model}_{args.dataset}/model.ckpt'
+	if modelname == 'AdvSTAD':
+		resolved_config = get_advstad_config(CONFIG, dims, lr_d[args.dataset])
+		model = model_class(dims, resolved_config).to(device=DEVICE, dtype=DTYPE)
+		optimizer, scheduler = build_optimizers(model)
+	else:
+		model = model_class(dims).to(device=DEVICE, dtype=DTYPE)
+		optimizer = torch.optim.AdamW(model.parameters() , lr=model.lr, weight_decay=1e-5)
+		scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 5, 0.9)
+	fname = f'checkpoints/{model_experiment_key(model)}/model.ckpt'
 	if os.path.exists(fname) and (not args.retrain or args.test):
 		print(f"{color.GREEN}Loading pre-trained model: {model.name}{color.ENDC}")
+		if modelname == 'AdvSTAD':
+			load_options = {'weights_only': True} if 'weights_only' in inspect.signature(torch.load).parameters else {}
+			checkpoint = torch.load(fname, map_location=DEVICE, **load_options)
+			epoch, accuracy_list = restore_checkpoint(checkpoint, model, optimizer, scheduler)
+			return model, optimizer, scheduler, epoch, accuracy_list
 		checkpoint = torch.load(fname, map_location=DEVICE)
 		model.load_state_dict(checkpoint['model_state_dict'])
 		optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -115,6 +150,16 @@ def load_model(modelname, dims):
 	return model, optimizer, scheduler, epoch, accuracy_list
 
 def backprop(epoch, model, data, feats, optimizer, scheduler, training = True):
+	if model.name == 'AdvSTAD':
+		if training:
+			metrics = train_epoch(model, data, optimizer, scheduler, epoch)
+			model.last_training_metrics = metrics
+			if not hasattr(model, 'training_history'):
+				model.training_history = []
+			model.training_history.append({'epoch': epoch, **metrics})
+			tqdm.write(f'Epoch {epoch},\tGenerator = {metrics["loss_g"]},\tAdversary = {metrics["loss_a"]}')
+			return metrics['loss_g'], metrics['lr_g']
+		return evaluate(model, data)
 	l = nn.MSELoss(reduction = 'mean' if training else 'none')
 	if 'DAGMM' in model.name:
 		l = nn.MSELoss(reduction = 'none')
@@ -339,23 +384,24 @@ def backprop(epoch, model, data, feats, optimizer, scheduler, training = True):
 
 def run_experiment(tracker):
 	trainD, testD, labels = load_dataset(args.dataset)
+	feats = validate_dataset_shapes(trainD, testD, labels)
 	tracker.log_dataset(trainD, testD, labels)
 	if args.model in ['MERLIN']:
 		result, evaluation_time = eval(f'run_{args.model.lower()}(testD, labels, args.dataset)')
 		tracker.log_overall_evaluation(result)
 		tracker.log_timing('evaluation', evaluation_time)
 		return
-	model, optimizer, scheduler, epoch, accuracy_list = load_model(args.model, labels.shape[1])
+	model, optimizer, scheduler, epoch, accuracy_list = load_model(args.model, feats)
 
 	## Prepare data
-	feats = labels.shape[1]
 	windowed = (
-		model.name in ['Attention', 'DAGMM', 'USAD', 'MSCRED', 'CAE_M', 'GDN', 'MTAD_GAT', 'MAD_GAN']
+		model.name in ['AdvSTAD', 'Attention', 'DAGMM', 'USAD', 'MSCRED', 'CAE_M', 'GDN', 'MTAD_GAT', 'MAD_GAN']
 		or 'TranAD' in model.name
 	)
-	num_epochs = 5
+	num_epochs = model.resolved_config['training']['epochs_per_run'] if model.name == 'AdvSTAD' else 5
+	artifact_key = model_experiment_key(model)
 	tracker.log_model(model, optimizer, scheduler, epoch + 1, windowed, num_epochs)
-	checkpoint_path = f'checkpoints/{args.model}_{args.dataset}/model.ckpt'
+	checkpoint_path = f'checkpoints/{artifact_key}/model.ckpt'
 	if epoch >= 0:
 		tracker.log_checkpoint(checkpoint_path, epoch, loaded=True)
 	testO = testD if not args.test else None
@@ -370,14 +416,20 @@ def run_experiment(tracker):
 			lossT, lr = backprop(e, model, trainD, feats, optimizer, scheduler)
 			accuracy_list.append((lossT, lr))
 			checkpoint_path = save_model(model, optimizer, scheduler, e, accuracy_list)
-			tracker.log_training_epoch(e, lossT, lr)
+			if model.name == 'AdvSTAD':
+				tracker.log_training_epoch(e, lossT, lr, metrics=model.last_training_metrics)
+			else:
+				tracker.log_training_epoch(e, lossT, lr)
 			tracker.log_checkpoint(checkpoint_path, e)
 		training_time = time() - start
 		print(color.BOLD+'Training time: '+"{:10.4f}".format(training_time)+' s'+color.ENDC)
 		tracker.log_timing('training', training_time)
-		plot_accuracies(accuracy_list, f'{args.model}_{args.dataset}')
+		if model.name == 'AdvSTAD':
+			plot_accuracies(accuracy_list, artifact_key, loss_label='Generator objective')
+		else:
+			plot_accuracies(accuracy_list, artifact_key)
 		tracker.log_artifact(
-			'training_plot', f'plots/{args.model}_{args.dataset}/training-graph.pdf',
+			'training_plot', f'plots/{artifact_key}/training-graph.pdf',
 		)
 
 	### Testing phase
@@ -393,8 +445,8 @@ def run_experiment(tracker):
 	### Plot curves
 	if not args.test:
 		if 'TranAD' in model.name: testO = torch.roll(testO, 1, 0) 
-		plotter(f'{args.model}_{args.dataset}', testO, y_pred, loss, labels)
-		tracker.log_artifact('evaluation_plot', f'plots/{args.model}_{args.dataset}/output.pdf')
+		plotter(artifact_key, testO, y_pred, loss, labels)
+		tracker.log_artifact('evaluation_plot', f'plots/{artifact_key}/output.pdf')
 		del testO
 	release_memory()
 
@@ -417,6 +469,8 @@ def run_experiment(tracker):
 	result.update(ndcg(loss, labels))
 	tracker.log_evaluation(lossT, loss, result, df)
 	tracker.log_timing('evaluation', time() - evaluation_start)
+	if model.name == 'AdvSTAD':
+		tracker.log_resource_usage(DEVICE)
 	print(df)
 	pprint(result)
 	# pprint(getresults2(df, result))

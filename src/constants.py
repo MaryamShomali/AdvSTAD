@@ -14,7 +14,7 @@ lm_d = {
 		'MSDS': [(0.91, 1), (0.9, 1.04)],
 		'MBA': [(0.87, 1), (0.93, 1.04)],
 	}
-lm = lm_d[args.dataset][1 if 'TranAD' in args.model else 0]
+lm = lm_d[args.dataset][1 if 'TranAD' in args.model or args.model == 'AdvSTAD' else 0]
 
 # Hyperparameters
 lr_d = {
