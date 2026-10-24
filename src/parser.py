@@ -10,7 +10,7 @@ parser.add_argument('--dataset',
 					type=str, 
 					required=False,
 					default='synthetic',
-                    help="dataset from ['synthetic', 'SMD']")
+                    help="dataset name, e.g. synthetic, SMD, SWaT, or WADI")
 parser.add_argument('--model', 
 					metavar='-m', 
 					type=str, 

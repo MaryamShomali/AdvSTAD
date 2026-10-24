@@ -4,12 +4,12 @@ import pandas as pd
 import numpy as np
 import pickle
 import json
+import argparse
 from src.folderconstants import *
+from src.industrial_preprocessing import preprocess_industrial
 from shutil import copyfile
 
 datasets = ['synthetic', 'SMD', 'SWaT', 'SMAP', 'MSL', 'WADI', 'MSDS', 'UCR', 'MBA', 'NAB']
-
-wadi_drop = ['2_LS_001_AL', '2_LS_002_AL','2_P_001_STATUS','2_P_002_STATUS']
 
 def load_and_save(category, filename, dataset, dataset_folder):
     temp = np.genfromtxt(os.path.join(dataset_folder, category, filename),
@@ -42,13 +42,13 @@ def normalize3(a, min_a = None, max_a = None):
 	if min_a is None: min_a, max_a = np.min(a, axis = 0), np.max(a, axis = 0)
 	return (a - min_a) / (max_a - min_a + 0.0001), min_a, max_a
 
-def convertNumpy(df):
-	x = df[df.columns[3:]].values[::10, :]
-	return (x - x.min(0)) / (x.ptp(0) + 1e-4)
-
-def load_data(dataset):
+def load_data(dataset, downsample=1):
 	folder = os.path.join(output_folder, dataset)
 	os.makedirs(folder, exist_ok=True)
+	if dataset in ['SWaT', 'WADI']:
+		return preprocess_industrial(dataset, os.path.join(data_folder, dataset), folder, downsample)
+	if downsample != 1:
+		raise ValueError('--downsample is supported only for SWaT and WADI')
 	if dataset == 'synthetic':
 		train_file = os.path.join(data_folder, dataset, 'synthetic_data_with_anomaly-s-1.csv')
 		test_labels = os.path.join(data_folder, dataset, 'test_anomaly.csv')
@@ -125,16 +125,6 @@ def load_data(dataset):
 		labels = labels.values[::1, 1:]
 		for file in ['train', 'test', 'labels']:
 			np.save(os.path.join(folder, f'{file}.npy'), eval(file).astype('float64'))
-	elif dataset == 'SWaT':
-		dataset_folder = 'data/SWaT'
-		file = os.path.join(dataset_folder, 'series.json')
-		df_train = pd.read_json(file, lines=True)[['val']][3000:6000]
-		df_test  = pd.read_json(file, lines=True)[['val']][7000:12000]
-		train, min_a, max_a = normalize2(df_train.values)
-		test, _, _ = normalize2(df_test.values, min_a, max_a)
-		labels = pd.read_json(file, lines=True)[['noti']][7000:12000] + 0
-		for file in ['train', 'test', 'labels']:
-			np.save(os.path.join(folder, f'{file}.npy'), eval(file))
 	elif dataset in ['SMAP', 'MSL']:
 		dataset_folder = 'data/SMAP_MSL'
 		file = os.path.join(dataset_folder, 'labeled_anomalies.csv')
@@ -155,33 +145,6 @@ def load_data(dataset):
 			for i in range(0, len(indices), 2):
 				labels[indices[i]:indices[i+1], :] = 1
 			np.save(f'{folder}/{fn}_labels.npy', labels)
-	elif dataset == 'WADI':
-		dataset_folder = 'data/WADI'
-		ls = pd.read_csv(os.path.join(dataset_folder, 'WADI_attacklabels.csv'))
-		train = pd.read_csv(os.path.join(dataset_folder, 'WADI_14days.csv'), skiprows=1000, nrows=2e5)
-		test = pd.read_csv(os.path.join(dataset_folder, 'WADI_attackdata.csv'))
-		train.dropna(how='all', inplace=True); test.dropna(how='all', inplace=True)
-		train.fillna(0, inplace=True); test.fillna(0, inplace=True)
-		test['Time'] = test['Time'].astype(str)
-		test['Time'] = pd.to_datetime(test['Date'] + ' ' + test['Time'])
-		labels = test.copy(deep = True)
-		for i in test.columns.tolist()[3:]: labels[i] = 0
-		for i in ['Start Time', 'End Time']: 
-			ls[i] = ls[i].astype(str)
-			ls[i] = pd.to_datetime(ls['Date'] + ' ' + ls[i])
-		for index, row in ls.iterrows():
-			to_match = row['Affected'].split(', ')
-			matched = []
-			for i in test.columns.tolist()[3:]:
-				for tm in to_match:
-					if tm in i: 
-						matched.append(i); break			
-			st, et = str(row['Start Time']), str(row['End Time'])
-			labels.loc[(labels['Time'] >= st) & (labels['Time'] <= et), matched] = 1
-		train, test, labels = convertNumpy(train), convertNumpy(test), convertNumpy(labels)
-		print(train.shape, test.shape, labels.shape)
-		for file in ['train', 'test', 'labels']:
-			np.save(os.path.join(folder, f'{file}.npy'), eval(file))
 	elif dataset == 'MBA':
 		dataset_folder = 'data/MBA'
 		ls = pd.read_excel(os.path.join(dataset_folder, 'labels.xlsx'))
@@ -200,11 +163,14 @@ def load_data(dataset):
 		raise Exception(f'Not Implemented. Check one of {datasets}')
 
 if __name__ == '__main__':
-	commands = sys.argv[1:]
-	load = []
-	if len(commands) > 0:
-		for d in commands:
-			load_data(d)
-	else:
-		print("Usage: python preprocess.py <datasets>")
-		print(f"where <datasets> is space separated list of {datasets}")
+	parser = argparse.ArgumentParser(description='Preprocess anomaly detection datasets')
+	parser.add_argument('datasets', nargs='+', choices=datasets)
+	parser.add_argument('--downsample', type=int, default=1,
+						help='keep every Nth observation in SWaT/WADI (default: 1, keep all rows)')
+	options = parser.parse_args()
+	if options.downsample < 1:
+		parser.error('--downsample must be a positive integer')
+	if options.downsample != 1 and any(d not in ['SWaT', 'WADI'] for d in options.datasets):
+		parser.error('--downsample is supported only for SWaT and WADI')
+	for dataset in options.datasets:
+		load_data(dataset, options.downsample)

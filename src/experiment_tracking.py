@@ -186,7 +186,7 @@ class ExperimentTracker:
 			summary_file.write('\n')
 		os.replace(temporary_path, self.summary_path)
 
-	def log_dataset(self, train_data, test_data, labels):
+	def log_dataset(self, train_data, test_data, labels, metadata=None):
 		if not self.enabled:
 			return
 		anomaly_count = int(np.count_nonzero(labels))
@@ -198,7 +198,11 @@ class ExperimentTracker:
 			'features': int(labels.shape[1]),
 			'anomalous_labels': anomaly_count,
 			'anomalous_label_rate': anomaly_count / labels.size,
+			'attack_timestamps': int(np.count_nonzero(np.any(labels != 0, axis=1))),
 		}
+		if metadata:
+			details['preprocessing'] = metadata
+			details['label_scope'] = metadata.get('label_scope')
 		self.record['dataset_details'] = details
 		if self.record['model'] == 'AdvSTAD':
 			# Sigmoid outputs are retained, but observations are never clipped.

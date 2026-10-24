@@ -58,6 +58,29 @@ python preprocess.py SMD
 python main.py --model TranAD --dataset SMD --retrain --run-name gpu-float32
 ```
 
+### Official SWaT and revised WADI data
+
+The loaders use the new `raw/` layout. SWaT reads `data/SWaT/raw/Physical/SWaT_Dataset_Normal_v1.xlsx` (sheet `Normal.csv`) and `SWaT_Dataset_Attack_v0.xlsx` (sheet `Combined Data`). Normal v1 already removes the initial 30-minute drainage period; preprocessing keeps all its observations. WADI reads `data/WADI/raw/WADI_14days_new.csv` and `WADI_attackdataLABLE.csv`, including the attack file's extra header line and excluding its two blank footer records. The attack tables remain supplementary annotations; the embedded data labels supply the evaluation targets.
+
+```bash
+python preprocess.py WADI SWaT
+python main.py --model AdvSTAD --dataset WADI --retrain
+python main.py --model AdvSTAD --dataset SWaT --retrain
+```
+
+Install `openpyxl` from `requirements.txt` to read the SWaT workbooks. Preprocessing strips column-name whitespace, aligns test features to training order, and removes entirely empty training features (the four empty WADI channels), leaving 123 WADI features and 51 SWaT features. Missing/non-finite readings use forward filling within each split followed by training medians for initial gaps. Min/max normalization is fitted on the full normal training split and reused for test data. Constant training columns use a scale of 1. Test values outside the training range remain outside `[0,1]`.
+
+Outputs are `processed/<dataset>/{train,test,labels}.npy` plus `metadata.json`, which records feature order, dropped columns, imputation/scaling statistics, source files, row counts, and sampling. All observations are retained by default. For smaller runs, `python preprocess.py WADI SWaT --downsample 10` keeps every tenth observation, using the same indices for test data and labels; short attacks between those indices can be omitted. Scaling and imputation still use the complete normal split. `--less` on `main.py` additionally reduces training data only.
+
+The supplied downloads produce these counts with the default sampling:
+
+| Dataset | Training rows | Test rows | Features | Attack timestamps |
+| --- | ---: | ---: | ---: | ---: |
+| WADI | 784,571 | 172,801 | 123 | 9,977 |
+| SWaT | 495,000 | 449,919 | 51 | 54,621 |
+
+Embedded labels are timestamp-level: SWaT `Normal`/`Attack` (including `A ttack`) and WADI `1`/`-1` become binary normal/attack targets. To match the existing model and plotting interfaces, each timestamp label is copied across feature columns. Per-feature detection metrics therefore measure each feature's scores against the global attack timeline. Sensor-localization metrics (`Hit@…` and `NDCG@…`) are skipped for these outputs. AdvSTAD checkpoints include the recorded feature order, and experiment tracking records the preprocessing metadata. Start with `--retrain` after replacing older processed data.
+
 Every run creates `runs/<run-id>/run.json`, `feature_metrics.csv`, and a `tensorboard/` event directory. Completed and failed run records are also appended to `experiments.jsonl`. The JSON fields mirror the label, model, dataset, date, and result information in `experiments.md`, and add configuration, dataset, environment, hyperparameter, checkpoint, timing, and artifact metadata. A `--test` run is tracked in the same way; training metrics are simply absent. This project has no separate validation phase, so the tracker does not create or evaluate a new validation split.
 
 AdvSTAD records resolved settings, the experiment key, both optimizers and schedulers, both learning rates, the three unsigned reconstruction errors, `L_G`, `L_A`, and `alpha`. Epoch metrics are weighted by minibatch sample count, including the final partial batch. Its existing training-curve output is labeled as the generator objective.

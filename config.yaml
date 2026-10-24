@@ -16,7 +16,7 @@ advstad:
   decoder_layers: 1
   dim_feedforward: 16
   dropout: 0.1
-  fusion: sum # sum | concat | cross_attention
+  fusion: concat # sum | concat | cross_attention
   training:
     epochs_per_run: 5
     learning_rate: null # use the dataset-specific baseline learning rate

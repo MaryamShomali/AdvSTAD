@@ -2,6 +2,7 @@ import pickle
 import os
 import sys
 import inspect
+import json
 import pandas as pd
 import torch
 from tqdm import tqdm
@@ -49,7 +50,7 @@ def convert_to_windows(data, model):
 def load_dataset(dataset):
 	folder = os.path.join(output_folder, dataset)
 	if not os.path.exists(folder):
-		raise Exception('Processed Data not found.')
+		raise FileNotFoundError(f'Processed data not found. Run: python preprocess.py {dataset}')
 	loaded = {}
 	for split in ['train', 'test', 'labels']:
 		file = split
@@ -71,6 +72,17 @@ def load_dataset(dataset):
 			)
 		del values
 	return loaded['train'], loaded['test'], loaded['labels']
+
+
+def load_dataset_metadata(dataset, feature_count):
+	path = os.path.join(output_folder, dataset, 'metadata.json')
+	if not os.path.exists(path):
+		return {}
+	with open(path, encoding='utf-8') as handle:
+		metadata = json.load(handle)
+	if len(metadata.get('feature_names', [])) != feature_count:
+		raise ValueError(f'Processed feature metadata disagrees with the arrays in {path}. Re-run preprocessing.')
+	return metadata
 
 def model_experiment_key(model):
 	if model.name == 'AdvSTAD':
@@ -114,12 +126,14 @@ def save_model(model, optimizer, scheduler, epoch, accuracy_list):
 		raise
 	return file_path
 
-def load_model(modelname, dims):
+def load_model(modelname, dims, sensor_identifiers=None):
 	import src.models
 	model_class = getattr(src.models, modelname)
 	if modelname == 'AdvSTAD':
 		resolved_config = get_advstad_config(CONFIG, dims, lr_d[args.dataset])
 		model = model_class(dims, resolved_config).to(device=DEVICE, dtype=DTYPE)
+		if sensor_identifiers is not None:
+			model.sensor_identifiers = list(sensor_identifiers)
 		optimizer, scheduler = build_optimizers(model)
 	else:
 		model = model_class(dims).to(device=DEVICE, dtype=DTYPE)
@@ -385,13 +399,18 @@ def backprop(epoch, model, data, feats, optimizer, scheduler, training = True):
 def run_experiment(tracker):
 	trainD, testD, labels = load_dataset(args.dataset)
 	feats = validate_dataset_shapes(trainD, testD, labels)
-	tracker.log_dataset(trainD, testD, labels)
+	dataset_metadata = load_dataset_metadata(args.dataset, feats)
+	tracker.log_dataset(trainD, testD, labels, metadata=dataset_metadata)
+	if dataset_metadata.get('label_scope') == 'timestamp':
+		print('Labels identify attack timestamps; sensor-localization metrics are omitted.')
 	if args.model in ['MERLIN']:
 		result, evaluation_time = eval(f'run_{args.model.lower()}(testD, labels, args.dataset)')
 		tracker.log_overall_evaluation(result)
 		tracker.log_timing('evaluation', evaluation_time)
 		return
-	model, optimizer, scheduler, epoch, accuracy_list = load_model(args.model, feats)
+	model, optimizer, scheduler, epoch, accuracy_list = load_model(
+		args.model, feats, sensor_identifiers=dataset_metadata.get('feature_names'),
+	)
 
 	## Prepare data
 	windowed = (
@@ -453,20 +472,22 @@ def run_experiment(tracker):
 	### Scores
 	if windowed and args.test:
 		trainD = convert_to_windows(trainD, model)
-	df = pd.DataFrame()
+	feature_results = []
 	with torch.no_grad():
 		lossT, _ = backprop(0, model, trainD, feats, optimizer, scheduler, training=False)
 	for i in range(loss.shape[1]):
 		lt, l, ls = lossT[:, i], loss[:, i], labels[:, i]
 		result, pred = pot_eval(lt, l, ls); preds.append(pred)
-		df = df.append(result, ignore_index=True)
+		feature_results.append(result)
+	df = pd.DataFrame(feature_results)
 	# preds = np.concatenate([i.reshape(-1, 1) + 0 for i in preds], axis=1)
 	# pd.DataFrame(preds, columns=[str(i) for i in range(10)]).to_csv('labels.csv')
 	lossTfinal, lossFinal = np.mean(lossT, axis=1), np.mean(loss, axis=1)
 	labelsFinal = (np.sum(labels, axis=1) >= 1) + 0
 	result, _ = pot_eval(lossTfinal, lossFinal, labelsFinal)
-	result.update(hit_att(loss, labels))
-	result.update(ndcg(loss, labels))
+	if dataset_metadata.get('label_scope') != 'timestamp':
+		result.update(hit_att(loss, labels))
+		result.update(ndcg(loss, labels))
 	tracker.log_evaluation(lossT, loss, result, df)
 	tracker.log_timing('evaluation', time() - evaluation_start)
 	if model.name == 'AdvSTAD':
