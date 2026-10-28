@@ -1,8 +1,16 @@
+import logging
+from numbers import Real
+
 import numpy as np
 
 from src.spot import SPOT
 from src.constants import *
 from sklearn.metrics import *
+
+
+_LOGGER = logging.getLogger(__name__)
+_POT_MAX_ATTEMPTS = 10
+
 
 def calc_point2point(predict, actual):
     """
@@ -130,15 +138,88 @@ def pot_eval(init_score, score, label, q=1e-5, level=0.02):
         level (float): Probability associated with the initial threshold t
     Returns:
         dict: pot result dict
+
+    Initialization uses lm[0], as before; level is retained for compatibility.
+    Invalid inputs raise ValueError. Initialization is limited to 10 attempts
+    (9 retries), then raises RuntimeError chained from the last SPOT error.
     """
     lms = lm[0]
-    while True:
+
+    def invalid_input(reason):
+        message = (
+            f'POT input validation failed (attempts=0, q={q!r}, level={lms!r}): '
+            f'{reason}'
+        )
+        _LOGGER.error(message)
+        raise ValueError(message)
+
+    arrays, summaries = [], []
+    for name, values in [('init_score', init_score), ('score', score), ('label', label)]:
+        try:
+            values = np.asarray(values)
+        except (TypeError, ValueError) as error:
+            invalid_input(f'{name} cannot be converted to an array: {error}')
+        if values.ndim != 1 or values.size == 0:
+            invalid_input(f'{name} must be a non-empty 1-D array; shape={values.shape}')
+        if values.dtype.kind not in 'biuf':
+            invalid_input(f'{name} must contain real numeric values; dtype={values.dtype}')
+        finite = np.isfinite(values)
+        if not finite.all():
+            invalid_input(
+                f'{name} contains NaN or Inf; size={values.size}, '
+                f'nonfinite_count={values.size - np.count_nonzero(finite)}'
+            )
+        minimum, maximum = values.min(), values.max()
+        summaries.append(
+            f'{name}(size={values.size}, dtype={values.dtype}, '
+            f'min={minimum!r}, max={maximum!r})'
+        )
+        if name == 'init_score' and minimum == maximum:
+            invalid_input(f'{summaries[-1]} is constant; SPOT cannot fit an empty peak set')
+        arrays.append(values)
+    init_score, score, label = arrays
+    if score.size != label.size:
+        invalid_input(f'score and label lengths differ: {score.size} != {label.size}')
+    if not isinstance(q, Real) or not np.isfinite(q) or not 0 < q < 1:
+        invalid_input(f'q must be finite and strictly between 0 and 1; value={q!r}')
+    # SPOT normalizes finite levels modulo 1; preserve that existing behavior.
+    if not isinstance(lms, Real) or not np.isfinite(lms):
+        invalid_input(f'lm[0] must be a finite real number; value={lms!r}')
+
+    diagnostics = '; '.join(summaries)
+    for attempt in range(1, _POT_MAX_ATTEMPTS + 1):
+        s = None
         try:
             s = SPOT(q)  # SPOT object
             s.fit(init_score, score)  # data import
             s.initialize(level=lms, min_extrema=False, verbose=False)  # initialization step
-        except: lms = lms * 0.999
-        else: break
+            if not np.isfinite(s.init_threshold) or not np.isfinite(s.extreme_quantile):
+                raise ValueError('SPOT initialization returned a non-finite threshold or quantile')
+        except MemoryError:
+            raise
+        except Exception as error:
+            message = (
+                f'POT initialization failed (attempt {attempt}/{_POT_MAX_ATTEMPTS}, '
+                f'retries={attempt - 1}, q={q!r}, level={lms!r}, '
+                f'init_threshold={getattr(s, "init_threshold", None)!r}, '
+                f'peaks={getattr(s, "Nt", None)!r}; {diagnostics}): '
+                f'{type(error).__name__}: {error}'
+            )
+            if attempt == _POT_MAX_ATTEMPTS:
+                _LOGGER.error(message, exc_info=True)
+                raise RuntimeError(
+                    f'POT initialization failed after {attempt} attempts '
+                    f'({attempt - 1} retries). {message}'
+                ) from error
+            _LOGGER.warning(message, exc_info=True)
+            lms = lms * 0.999
+        else:
+            if attempt > 1:
+                _LOGGER.info(
+                    'POT initialization succeeded after %d attempts (%d retries), level=%r',
+                    attempt, attempt - 1, lms,
+                )
+            break
     ret = s.run(dynamic=False)  # run
     # print(len(ret['alarms']))
     # print(len(ret['thresholds']))
