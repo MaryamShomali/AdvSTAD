@@ -185,13 +185,19 @@ def test_timestamp_labels_skip_localization_and_are_tracked(monkeypatch, tmp_pat
                                 'index_file': str(tmp_path / 'experiments.jsonl')},
     }
     arguments = SimpleNamespace(dataset='WADI', model='AdvSTAD', less=False,
-                                test=True, retrain=True, run_name='new-release')
+                                test=False, retrain=True, run_name='new-release')
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main, 'output_folder', str(tmp_path / 'processed'))
     monkeypatch.setattr(main, 'CONFIG', config)
     monkeypatch.setattr(main, 'args', arguments)
     monkeypatch.setattr(main, 'DEVICE', torch.device('cpu'))
     monkeypatch.setattr(main, 'DTYPE', torch.float32)
+    # This metadata-only test needs a temporary checkpoint under the --test
+    # safety policy; no optimization or real-dataset experiment is performed.
+    model, optimizer, scheduler, _, history = main.load_model(
+        'AdvSTAD', 2, ['SENSOR_A', 'SENSOR_B'])
+    main.save_model(model, optimizer, scheduler, 0, history)
+    arguments.test = True
     pot_labels = []
     def fake_pot(reference, score, target):
         pot_labels.append(target.copy())

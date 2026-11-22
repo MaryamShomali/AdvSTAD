@@ -1,0 +1,25 @@
+Metric,TranAD,TranAD_Corrected,AdvSTAD_NoSpatial,AdvSTAD
+Dataset,N/A,N/A,N/A,N/A
+SMD machine,N/A,N/A,N/A,N/A
+Run ID,N/A,N/A,N/A,N/A
+Random seed,N/A,N/A,N/A,N/A
+Comparability,N/A,N/A,N/A,N/A
+Window alignment,N/A,N/A,N/A,N/A
+Window length,N/A,N/A,N/A,N/A
+Checkpoint,N/A,N/A,N/A,N/A
+Execution status,N/A,N/A,N/A,N/A
+Precision,N/A,N/A,N/A,N/A
+Recall,N/A,N/A,N/A,N/A
+F1-score,N/A,N/A,N/A,N/A
+Total training time (seconds),N/A,N/A,N/A,N/A
+Average training time per epoch (seconds),N/A,N/A,N/A,N/A
+Total inference time (seconds),N/A,N/A,N/A,N/A
+Average inference latency per timepoint (milliseconds),N/A,N/A,N/A,N/A
+Number of training epochs (total),N/A,N/A,N/A,N/A
+Number of training epochs (this run),N/A,N/A,N/A,N/A
+Number of trainable parameters,N/A,N/A,N/A,N/A
+Peak GPU memory (MB),N/A,N/A,N/A,N/A
+Peak RAM (MB; process lifetime),N/A,N/A,N/A,N/A
+Timing version,N/A,N/A,N/A,N/A
+Device,N/A,N/A,N/A,N/A
+Dtype,N/A,N/A,N/A,N/A

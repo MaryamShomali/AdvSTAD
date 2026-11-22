@@ -5,14 +5,85 @@ import platform
 import re
 import subprocess
 import sys
+import copy
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
 
+from src.reproducibility import seeding_metadata
+
+from src.study_protocol import (
+	ABLATION_MODELS, ADVSTAD_MODELS, SMD_MACHINE_ID, TIMING_VERSION,
+	evaluation_protocol, window_alignment,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _effective_model_config(model, epochs_per_run):
+	"""Inspect constructed modules; the shared YAML does not configure TranAD."""
+	if model.name in ADVSTAD_MODELS:
+		settings = copy.deepcopy(model.resolved_config)
+		encoder = model.temporal_encoder[0]
+		settings['output_heads'] = 'separate'
+		settings['configuration_source'] = 'advstad YAML with resolved dimensions and inactive spatial settings removed'
+	else:
+		encoder = model.transformer_encoder.layers[0]
+		settings = {
+			'window_size': model.n_window,
+			'batch_size': model.batch,
+			'd_model': encoder.self_attn.embed_dim,
+			'nhead': encoder.self_attn.num_heads,
+			'temporal_layers': len(model.transformer_encoder.layers),
+			'spatial_layers': 0,
+			'decoder_layers': len(model.transformer_decoder1.layers),
+			'decoder2_layers': len(model.transformer_decoder2.layers),
+			'dim_feedforward': encoder.linear1.out_features,
+			'dropout': model.pos_encoder.dropout.p,
+			'fusion': None,
+			'output_heads': 'shared',
+			'configuration_source': 'fixed TranAD constructor and dataset learning rate; advstad YAML does not apply',
+			'training': {
+				'epochs_per_run': epochs_per_run,
+				'learning_rate': model.lr,
+				'adversarial_weight': None,
+				'gradient_clip_norm': None,
+			},
+		}
+	parameter = next(model.parameters())
+	settings.update(
+		model=model.name, n_feats=model.n_feats,
+		window_alignment=window_alignment(model.name),
+		attention_dropout=encoder.self_attn.dropout,
+		activation=encoder.activation.__class__.__name__,
+		seed=torch.initial_seed(), device=str(parameter.device),
+		dtype=str(parameter.dtype).replace('torch.', ''),
+	)
+	settings['training']['epochs_per_run'] = epochs_per_run
+	settings['training']['objective'] = (
+		'anchored_adversarial_v1' if model.name in ADVSTAD_MODELS
+		else 'tranad_epoch_weighted_reconstruction_v1'
+	)
+	settings['training']['optimizer_updates_per_batch'] = 2 if model.name in ADVSTAD_MODELS else 1
+	return settings
+
+
+def _cpu_name():
+	name = platform.processor()
+	if name:
+		return name
+	try:
+		with open('/proc/cpuinfo', encoding='utf-8') as handle:
+			for line in handle:
+				if line.startswith('model name'):
+					return line.partition(':')[2].strip()
+	except OSError:
+		pass
+	return platform.machine()
 
 
 def _timestamp():
@@ -103,7 +174,7 @@ class ExperimentTracker:
 			getattr(args, 'run_name', None), args.model, args.dataset,
 		)))
 		run_suffix = re.sub(r'[^A-Za-z0-9_.-]+', '-', run_suffix).strip('-')
-		run_id = f'{compact_time}-{run_suffix}'
+		run_id = f'{compact_time}-{run_suffix}-{uuid4().hex[:12]}'
 		self.run_dir = log_root / run_id
 		tensorboard_dir = self.run_dir / 'tensorboard'
 		self.summary_path = self.run_dir / 'run.json'
@@ -129,6 +200,8 @@ class ExperimentTracker:
 			'label': label,
 			'model': args.model,
 			'dataset': args.dataset,
+			'seed': torch.initial_seed(),
+			'reproducibility': seeding_metadata(),
 			'status': 'running',
 			'timestamps': {
 				'started_at': started_at,
@@ -146,18 +219,42 @@ class ExperimentTracker:
 				'platform': platform.platform(),
 				'hostname': platform.node(),
 				'pytorch': torch.__version__,
+				'cpu': _cpu_name(),
+				'cpu_count': os.cpu_count(),
+				'torch_threads': torch.get_num_threads(),
+				'cuda_runtime': torch.version.cuda,
 				'requested_device': config.get('device'),
 				'device': str(device),
 				'dtype': dtype_name,
 				'cuda_available': torch.cuda.is_available(),
+				'gpu_memory_cap_configured_by_project': False,
+				'cuda_allocator_configuration': os.environ.get('PYTORCH_CUDA_ALLOC_CONF'),
+				'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+				'precision': {
+					'amp_enabled': False,
+					'tf32_matmul': getattr(torch.backends.cuda.matmul, 'allow_tf32', None),
+					'tf32_cudnn': getattr(torch.backends.cudnn, 'allow_tf32', None),
+				},
 			},
 			'git': _git_metadata(),
-			'dataset_details': {},
+			'dataset_details': {'machine_id': SMD_MACHINE_ID} if args.dataset == 'SMD' else {},
 			'hyperparameters': {},
 			'checkpoint': {},
 			'metrics': {
 				'training': [],
 				'evaluation': {},
+				'runtime': {
+					'timing_version': TIMING_VERSION,
+					'training_total_seconds': None,
+					'training_average_epoch_seconds': None,
+					'inference_total_seconds': None,
+					'inference_latency_ms_per_timepoint': None,
+					'training_epochs_this_run': 0,
+					'training_epochs_total': 0,
+					'training_boundary': 'Sum of synchronized backprop/training-epoch calls; excludes loading, windowing, checkpoint writes and tracking.',
+					'inference_boundary': 'Synchronized test scoring, including batching, reconstruction errors and CPU output transfer; excludes loading, windowing, calibration, plots, thresholding and metrics.',
+					'memory_scope': 'Process-lifetime peaks, including loading, training, plotting and evaluation; not isolated model peaks.',
+				},
 			},
 			'artifacts': {
 				'run_directory': _path_from_project(self.run_dir),
@@ -167,8 +264,12 @@ class ExperimentTracker:
 				'experiment_index': _path_from_project(self.index_file),
 			},
 		}
+		if args.model in ABLATION_MODELS:
+			from src.constants import lm_d
+			self.record['evaluation_protocol'] = evaluation_protocol(*lm_d[args.dataset][1])
 		if device.type == 'cuda':
 			self.record['environment']['cuda_device'] = torch.cuda.get_device_name(device)
+			self.record['environment']['gpu_total_memory_bytes'] = torch.cuda.get_device_properties(device).total_memory
 		self.writer.add_text('experiment/configuration', json.dumps(
 			_json_safe(config), indent=2, sort_keys=True,
 		))
@@ -204,7 +305,9 @@ class ExperimentTracker:
 			details['preprocessing'] = metadata
 			details['label_scope'] = metadata.get('label_scope')
 		self.record['dataset_details'] = details
-		if self.record['model'] == 'AdvSTAD':
+		if self.record['dataset'] == 'SMD':
+			details['machine_id'] = SMD_MACHINE_ID
+		if self.record['model'] in ADVSTAD_MODELS:
 			# Sigmoid outputs are retained, but observations are never clipped.
 			details['observation_ranges'] = {
 				name: {'min': float(values.min()), 'max': float(values.max())}
@@ -214,6 +317,12 @@ class ExperimentTracker:
 		self.writer.add_scalar('dataset/test_time_steps', test_data.shape[0], 0)
 		self.writer.add_scalar('dataset/features', labels.shape[1], 0)
 		self.writer.add_scalar('dataset/anomalous_label_rate', details['anomalous_label_rate'], 0)
+		self._write_summary()
+
+	def log_data_provenance(self, provenance):
+		if not self.enabled:
+			return
+		self.record['dataset_details'].update(provenance)
 		self._write_summary()
 
 	def log_model(self, model, optimizer, scheduler, starting_epoch, windowed, epochs_per_run):
@@ -231,6 +340,9 @@ class ExperimentTracker:
 				'name': value.__class__.__name__,
 				'learning_rate': value.param_groups[0]['lr'],
 				'weight_decay': value.param_groups[0].get('weight_decay'),
+				'betas': value.param_groups[0].get('betas'),
+				'eps': value.param_groups[0].get('eps'),
+				'amsgrad': value.param_groups[0].get('amsgrad'),
 			}
 
 		def scheduler_details(value):
@@ -257,7 +369,7 @@ class ExperimentTracker:
 		else:
 			hyperparameters['optimizer'] = optimizer_details(optimizer)
 			hyperparameters['scheduler'] = scheduler_details(scheduler)
-		if model.name == 'AdvSTAD':
+		if model.name in ADVSTAD_MODELS:
 			from src.advstad_checkpoint import checkpoint_metadata, experiment_key
 			metadata = checkpoint_metadata(model)
 			hyperparameters['advstad'] = model.resolved_config
@@ -267,7 +379,16 @@ class ExperimentTracker:
 			self.record['dataset_details']['window_alignment'] = metadata['window_alignment']
 			self.record['dataset_details']['sensor_identifiers'] = metadata['sensor_identifiers']
 		elif 'TranAD' in model.name:
-			self.record['dataset_details']['window_alignment'] = 'legacy_previous_endpoint'
+			self.record['dataset_details']['window_alignment'] = window_alignment(model.name)
+		if model.name in ABLATION_MODELS:
+			hyperparameters['effective_config'] = _effective_model_config(model, epochs_per_run)
+			hyperparameters['training_seed'] = getattr(model, 'training_seed', None)
+			hyperparameters['effective_config']['training']['seed'] = hyperparameters['training_seed']
+			hyperparameters['training_objective'] = (
+				'anchored_adversarial_v1' if model.name in ADVSTAD_MODELS
+				else 'tranad_epoch_weighted_reconstruction_v1'
+			)
+			hyperparameters['independent_spatial_encoder'] = model.name == 'AdvSTAD'
 		self.record['hyperparameters'] = hyperparameters
 		self.writer.add_text('experiment/hyperparameters', json.dumps(
 			_json_safe(hyperparameters), indent=2, sort_keys=True,
@@ -312,6 +433,16 @@ class ExperimentTracker:
 			return
 		self.record['metrics'].setdefault('timing_seconds', {})[name] = seconds
 		self.writer.add_scalar(f'timing/{_metric_tag(name)}_seconds', seconds, 0)
+		self._write_summary()
+
+	def log_runtime(self, **measurements):
+		"""Extend one run's timings without borrowing values from another run."""
+		if not self.enabled:
+			return
+		self.record['metrics']['runtime'].update(measurements)
+		for name, value in measurements.items():
+			if isinstance(value, (int, float)) and math.isfinite(value):
+				self.writer.add_scalar(f'runtime/{name}', value, 0)
 		self._write_summary()
 
 	def log_resource_usage(self, device):

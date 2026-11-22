@@ -1,4 +1,4 @@
-"""Versioned persistence and shared artifact identifiers for AdvSTAD only."""
+"""Versioned persistence and artifact identifiers for the AdvSTAD variants."""
 
 import copy
 import hashlib
@@ -29,7 +29,7 @@ def checkpoint_metadata(model):
         if len(identifiers) != model.n_feats:
             raise ValueError("AdvSTAD sensor identifiers must match the feature count")
     return {
-        "model": "AdvSTAD",
+        "model": model.name,
         "resolved_config": config,
         "n_feats": model.n_feats,
         "n_window": model.n_window,
@@ -54,7 +54,7 @@ def experiment_key(model, dataset):
     fingerprint = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:12]
     dataset_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(dataset)).strip("._") or "dataset"
     fusion = model.resolved_config["fusion"]
-    return f"AdvSTAD_{dataset_name}_{fusion}_{fingerprint}"
+    return f"{model.name}_{dataset_name}_{fusion}_{fingerprint}"
 
 
 def _validate_owners(collection, description):

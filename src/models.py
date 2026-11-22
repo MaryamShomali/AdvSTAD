@@ -1,3 +1,5 @@
+import copy
+from collections.abc import Mapping
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,8 +11,9 @@ from torch.nn import TransformerEncoder
 from torch.nn import TransformerDecoder
 from src.dlutils import *
 from src.constants import *
-from src.config import get_advstad_config
-torch.manual_seed(1)
+from src.config import SEED, get_advstad_config
+from src.reproducibility import seed_everything
+seed_everything(SEED)
 
 ## Separate LSTM for each variable
 class LSTM_Univariate(nn.Module):
@@ -526,8 +529,14 @@ class TranAD(nn.Module):
 		x2 = self.fcn(self.transformer_decoder2(*self.encode(src, c, tgt)))
 		return x1, x2
 
-	#advstad
-	
+
+class TranAD_Corrected(TranAD):
+    """TranAD architecture with inclusive endpoint windows supplied by the runner."""
+
+    def __init__(self, feats):
+        super().__init__(feats)
+        self.name = "TranAD_Corrected"
+
 
 class SpatioTemporalFusion(nn.Module):
     """Fuse time tokens [W,B,D] and sensor tokens [F,B,D] into [W,B,D]."""
@@ -595,12 +604,20 @@ class AdvSTAD(nn.Module):
 
     def __init__(self, feats, config=None):
         super().__init__()
+        self._initialize(feats, config, include_spatial=True)
+
+    def _initialize(self, feats, config, include_spatial):
+        # Retain the original module creation order for the full AdvSTAD model:
+        # existing seeded initializations and checkpoint tensor names stay valid.
         self.config = get_advstad_config(
             {"advstad": {} if config is None else config}, feats, lr
         )
+        if not include_spatial:
+            self.config["fusion"] = "temporal_only"
+            self.config["spatial_layers"] = 0
         self.resolved_config = self.config
         settings = self.config
-        self.name = "AdvSTAD"
+        self.name = "AdvSTAD" if include_spatial else "AdvSTAD_NoSpatial"
         self.n_feats = int(feats)
         self.n_window = settings["window_size"]
         self.batch = settings["batch_size"]
@@ -614,10 +631,11 @@ class AdvSTAD(nn.Module):
             else nn.Linear(2 * self.n_feats, self.d_model)
         )
         self.pos_encoder = PositionalEncoding(self.d_model, dropout, self.n_window)
-        self.spatial_input_projection = nn.Linear(2 * self.n_window, self.d_model)
-        self.sensor_embedding = nn.Parameter(torch.empty(self.n_feats, 1, self.d_model))
-        nn.init.normal_(self.sensor_embedding, std=0.02)
-        self.spatial_dropout = nn.Dropout(dropout)
+        if include_spatial:
+            self.spatial_input_projection = nn.Linear(2 * self.n_window, self.d_model)
+            self.sensor_embedding = nn.Parameter(torch.empty(self.n_feats, 1, self.d_model))
+            nn.init.normal_(self.sensor_embedding, std=0.02)
+            self.spatial_dropout = nn.Dropout(dropout)
 
         layer_settings = {
             "d_model": self.d_model, "nhead": self.nhead,
@@ -627,14 +645,15 @@ class AdvSTAD(nn.Module):
             TransformerEncoderLayer(**layer_settings)
             for _ in range(settings["temporal_layers"])
         ])
-        self.spatial_encoder = nn.ModuleList([
-            TransformerEncoderLayer(**layer_settings)
-            for _ in range(settings["spatial_layers"])
-        ])
-        self.fusion = SpatioTemporalFusion(
-            settings["fusion"], self.n_feats, self.n_window,
-            self.d_model, self.nhead, dropout,
-        )
+        if include_spatial:
+            self.spatial_encoder = nn.ModuleList([
+                TransformerEncoderLayer(**layer_settings)
+                for _ in range(settings["spatial_layers"])
+            ])
+            self.fusion = SpatioTemporalFusion(
+                settings["fusion"], self.n_feats, self.n_window,
+                self.d_model, self.nhead, dropout,
+            )
         self.target_projection = (
             nn.Identity() if self.d_model == 2 * self.n_feats
             else nn.Linear(2 * self.n_feats, self.d_model)
@@ -714,3 +733,44 @@ class AdvSTAD(nn.Module):
             y2_base = self.decode2(prepared["query"], prepared["memory0"])
             return {"y1": prepared["y1"], "y2": y2, "y2_base": y2_base}
         return prepared["y1"], y2
+
+
+class AdvSTAD_NoSpatial(AdvSTAD):
+    """AdvSTAD's temporal route, queries, decoders, and adversarial objectives.
+
+    Temporal memory goes straight to the decoders: no spatial modules or fusion
+    projections are constructed. The effective configuration records
+    ``fusion=temporal_only`` and ``spatial_layers=0`` irrespective of the inactive
+    spatial settings in the shared YAML configuration.
+    """
+
+    def __init__(self, feats, config=None):
+        nn.Module.__init__(self)
+        # Accept our own effective configuration as well as the shared AdvSTAD
+        # YAML settings, without extending the full model's validation rules.
+        if isinstance(config, Mapping) and config.get("fusion") == "temporal_only":
+            config = copy.deepcopy(dict(config))
+            config["fusion"] = "sum"
+            if config.get("spatial_layers") == 0:
+                config["spatial_layers"] = 1
+        self._initialize(feats, config, include_spatial=False)
+
+    def _validate_tensor(self, tensor, name, tokens, width):
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 3:
+            raise ValueError(f"{name} must be a rank-3 [{tokens},B,{width}] tensor")
+        if tensor.shape[0] != tokens or tensor.shape[2] != width or tensor.shape[1] < 1:
+            raise ValueError(f"{name} must have shape [{tokens},B,{width}] with B > 0")
+        reference = next(self.parameters())
+        if tensor.dtype != reference.dtype or tensor.device != reference.device:
+            raise ValueError(f"{name} must match the model dtype/device")
+
+    def encode(self, src, conditioning):
+        self._validate_tensor(src, "src", self.n_window, self.n_feats)
+        self._validate_tensor(conditioning, "conditioning", self.n_window, self.n_feats)
+        if conditioning.shape != src.shape:
+            raise ValueError("conditioning and src shapes must match")
+        temporal = self.temporal_input_projection(torch.cat((src, conditioning), dim=-1))
+        temporal = self.pos_encoder(temporal * math.sqrt(self.n_feats))
+        for layer in self.temporal_encoder:
+            temporal = layer(temporal)
+        return temporal

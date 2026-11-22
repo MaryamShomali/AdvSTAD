@@ -16,7 +16,7 @@ parser.add_argument('--model',
 					type=str, 
 					required=False,
 					default='LSTM_Multivariate',
-                    help="model name, e.g. AdvSTAD, TranAD, or LSTM_Multivariate")
+                    help="model name, e.g. TranAD, TranAD_Corrected, AdvSTAD_NoSpatial, AdvSTAD, or LSTM_Multivariate")
 parser.add_argument('--test', 
 					action='store_true', 
 					help="test the model")

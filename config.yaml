@@ -1,5 +1,6 @@
 device: "cuda" # cuda or cpu
 dtype: "float32" # float32 uses half the memory of float64
+seed: 1 # Python, NumPy, PyTorch and CUDA; preserves the original PyTorch seed
 
 experiment_tracking:
   enabled: true

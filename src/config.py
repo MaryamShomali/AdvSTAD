@@ -8,6 +8,9 @@ from pathlib import Path
 import torch
 import yaml
 
+from src.reproducibility import validate_seed
+from src.study_protocol import DEFAULT_SEED
+
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
@@ -47,6 +50,10 @@ def get_dtype(config):
         supported = ", ".join(dtypes)
         raise ValueError(f"config.yaml 'dtype' must be one of: {supported}")
     return dtypes[dtype_name]
+
+
+def get_seed(config):
+    return validate_seed(config.get("seed", DEFAULT_SEED))
 
 
 ADVSTAD_DEFAULTS = {
@@ -140,3 +147,4 @@ def get_advstad_config(config, feats, default_lr):
 CONFIG = load_config()
 DEVICE = get_device(CONFIG)
 DTYPE = get_dtype(CONFIG)
+SEED = get_seed(CONFIG)

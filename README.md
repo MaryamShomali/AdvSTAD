@@ -2,6 +2,8 @@
 
 AdvSTAD extends the repository's TranAD baseline with independent temporal and sensor attention encoders, configurable fusion, and two reconstruction decoders. Select it with `--model AdvSTAD`; existing models remain available.
 
+The four-model ablation workflow also provides `TranAD_Corrected` and `AdvSTAD_NoSpatial`, with independent checkpoints and the same selected SMD machine, `machine-1-1`. See [the ablation study guide](docs/ablation_study.md) for model differences, manual execution commands, timing boundaries, and the saved-results-only `python ablation_study.py --compare` command.
+
 ```bash
 python main.py --model AdvSTAD --dataset SMD --retrain --run-name sum-baseline
 python main.py --model AdvSTAD --dataset SMD          # resume the matching checkpoint
